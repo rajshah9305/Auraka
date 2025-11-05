@@ -1,0 +1,219 @@
+import os
+import subprocess
+import json
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from contextlib import asynccontextmanager
+from duckduckgo_search import DDGS
+from langchain_openai import OpenAIEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+
+# --- Models for API ---
+class FileWriteRequest(BaseModel):
+    filename: str
+    content: str
+
+class CodeExecRequest(BaseModel):
+    code: str
+    lang: str  # e.g., "python" or "bash"
+
+class MemoryAddRequest(BaseModel):
+    text: str
+    metadata: dict = {}
+
+# --- Global State for Peripherals ---
+# This dictionary will hold our "in-memory" peripherals
+peripherals = {}
+WORKSPACE_DIR = "./aura_workspace"
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- BOOT: Initialize Peripherals ---
+    print("--- MCP SERVER: Booting peripherals... ---")
+    
+    # L4: Initialize Long-Term Memory (Vector DB)
+    try:
+        peripherals["embeddings"] = OpenAIEmbeddings()
+        peripherals["vector_store"] = FAISS.from_texts(
+            ["Aura OS Bootstrapped"], 
+            peripherals["embeddings"],
+            metadatas=[{"source": "kernel"}]
+        )
+        peripherals["text_splitter"] = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+        print("--- MCP SERVER: Long-Term Memory (FAISS) initialized. ---")
+    except Exception as e:
+        print(f"--- MCP SERVER: FATAL - Failed to init OpenAI Embeddings. Is OPENAI_API_KEY set? ---")
+        print(f"Error: {e}")
+        # We don't exit, but memory peripheral will fail
+    
+    # L3: Initialize File System (Workspace)
+    os.makedirs(WORKSPACE_DIR, exist_ok=True)
+    print(f"--- MCP SERVER: File System (FS) peripheral initialized at {WORKSPACE_DIR}. ---")
+    
+    # L3: Initialize Web Search
+    peripherals["web_search"] = DDGS()
+    print("--- MCP SERVER: Web Search (DuckDuckGo) peripheral initialized. ---")
+    
+    print("--- MCP SERVER: All peripherals online. Aura I/O Bus is operational. ---")
+    yield
+    # --- SHUTDOWN: Clean up ---
+    peripherals.clear()
+    print("--- MCP SERVER: Shutdown complete. ---")
+
+# Initialize the FastAPI App
+app = FastAPI(lifespan=lifespan, title="Aura OS - MCP Server")
+
+# --- Helper Functions ---
+def get_vector_store() -> FAISS:
+    return peripherals.get("vector_store")
+
+def get_embeddings():
+    return peripherals.get("embeddings")
+
+def get_text_splitter() -> RecursiveCharacterTextSplitter:
+    return peripherals.get("text_splitter")
+
+def get_web_search() -> DDGS:
+    return peripherals.get("web_search")
+
+def resolve_path(filename: str) -> str:
+    """Safely resolve a path within the workspace directory."""
+    abs_path = os.path.abspath(os.path.join(WORKSPACE_DIR, filename))
+    if not abs_path.startswith(os.path.abspath(WORKSPACE_DIR)):
+        raise HTTPException(status_code=403, detail="File path is outside the workspace")
+    return abs_path
+
+# ============================================
+# === LAYER 3: I/O BUS (Peripheral Endpoints)
+# ============================================
+
+# --- FS Peripheral ---
+@app.post("/fs/write")
+async def fs_write(req: FileWriteRequest):
+    """Writes content to a file in the workspace."""
+    try:
+        path = resolve_path(req.filename)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(req.content)
+        return {"status": "success", "filename": req.filename, "bytes_written": len(req.content)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"File write error: {e}")
+
+@app.get("/fs/read")
+async def fs_read(filename: str):
+    """Reads content from a file in the workspace."""
+    try:
+        path = resolve_path(filename)
+        with open(path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        return {"status": "success", "filename": filename, "content": content}
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="File not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"File read error: {e}")
+
+@app.get("/fs/list")
+async def fs_list(path: str = "."):
+    """Lists files/dirs in a workspace path."""
+    try:
+        dir_path = resolve_path(path)
+        files = os.listdir(dir_path)
+        return {"status": "success", "path": path, "files": files}
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Path not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"File list error: {e}")
+
+# --- Web Peripheral ---
+@app.get("/web/search")
+async def web_search(query: str):
+    """Performs a web search using DuckDuckGo."""
+    try:
+        searcher = get_web_search()
+        if not searcher:
+            raise HTTPException(status_code=503, detail="Web Search peripheral is not available")
+        results = searcher.text(query, max_results=5)
+        return {"status": "success", "query": query, "results": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Web search error: {e}")
+
+# ============================================
+# === LAYER 4: MEMORY (Peripheral Endpoints)
+# ============================================
+
+@app.post("/memory/add")
+async def memory_add(req: MemoryAddRequest):
+    """Adds text to the Long-Term Memory (Vector DB)."""
+    try:
+        vector_store = get_vector_store()
+        text_splitter = get_text_splitter()
+        if not vector_store or not text_splitter:
+            raise HTTPException(status_code=503, detail="Memory peripheral is not available")
+        
+        docs = text_splitter.create_documents([req.text], metadatas=[req.metadata])
+        doc_ids = await vector_store.aadd_documents(docs)
+        return {"status": "success", "action": "add", "doc_ids": doc_ids}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Memory add error: {e}")
+
+@app.get("/memory/query")
+async def memory_query(query: str, k: int = 4):
+    """Queries the Long-Term Memory (Vector DB)."""
+    try:
+        vector_store = get_vector_store()
+        if not vector_store:
+            raise HTTPException(status_code=503, detail="Memory peripheral is not available")
+        
+        results = await vector_store.asimilarity_search(query, k=k)
+        return {"status": "success", "action": "query", "results": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Memory query error: {e}")
+
+# ============================================
+# === LAYER 5: SECURE CORE (Simulated Endpoint)
+# ============================================
+
+@app.post("/sandbox/exec")
+async def sandbox_exec(req: CodeExecRequest):
+    """
+    Simulates the Secure Core sandbox.
+    WARNING: This is NOT secure! It runs code directly on the host.
+    A real system would use Firecracker VMs (e.t., E2B).
+    """
+    print(f"--- SANDBOX (SIMULATED): Executing {req.lang} code... ---")
+    
+    if req.lang == "python":
+        command = ["python", "-c", req.code]
+    elif req.lang == "bash":
+        command = ["bash", "-c", req.code]
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported language: {req.lang}")
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=10,  # 10 second timeout
+            cwd=WORKSPACE_DIR # Run code inside the workspace
+        )
+        print(f"--- SANDBOX (SIMULATED): Execution finished. ---")
+        return {
+            "status": "success",
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "return_code": result.returncode
+        }
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=408, detail="Code execution timed out")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Code execution error: {e}")
+
+# --- Main entry point for Uvicorn ---
+if __name__ == "__main__":
+    import uvicorn
+    print("--- Booting Aura MCP Server on http://127.0.0.1:8100 ---")
+    uvicorn.run(app, host="127.0.0.1", port=8100)
+

@@ -1,0 +1,291 @@
+import os
+import json
+import httpx
+from typing import TypedDict, Annotated
+from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolExecutor
+from langgraph.graph.message import MessagesAddingReduped, add_messages
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.tools import tool
+
+# --- Prerequisite ---
+# This script requires the OpenAI API key to be set as an environment variable.
+# Ensure: OPENAI_API_KEY="your_api_key_here"
+
+# --- Configuration ---
+if "OPENAI_API_KEY" not in os.environ:
+    print("="*50)
+    print("ERROR: OPENAI_API_KEY environment variable not set.")
+    print("Please set your API key to run this script.")
+    print("="*50)
+    exit()
+
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+MCP_SERVER_URL = "http://127.0.0.1:8100"
+
+# ============================================
+# === LAYER 3: I/O BUS (Client-Side Tools)
+# ============================================
+# These are the client-side tools the agent will use.
+# They are just thin wrappers that call the MCP Server.
+
+@tool
+def write_file(filename: str, content: str):
+    """
+    Writes content to a file in the workspace, via the 'aura-fs-mcp' server.
+    """
+    print(f"--- KERNEL: Calling I/O BUS (write_file: {filename}) ---")
+    try:
+        with httpx.Client() as client:
+            res = client.post(
+                f"{MCP_SERVER_URL}/fs/write",
+                json={"filename": filename, "content": content},
+                timeout=10
+            )
+            res.raise_for_status() # Raise an exception for bad status codes
+            return res.json()
+    except Exception as e:
+        return f"Error calling fs/write: {e}"
+
+@tool
+def read_file(filename: str):
+    """
+    Reads content from a file in the workspace, via the 'aura-fs-mcp' server.
+    """
+    print(f"--- KERNEL: Calling I/O BUS (read_file: {filename}) ---")
+    try:
+        with httpx.Client() as client:
+            res = client.get(f"{MCP_SERVER_URL}/fs/read", params={"filename": filename}, timeout=10)
+            res.raise_for_status()
+            return res.json()
+    except Exception as e:
+        return f"Error calling fs/read: {e}"
+
+@tool
+def list_files(path: str = "."):
+    """
+    Lists files in a workspace directory, via the 'aura-fs-mcp' server.
+    """
+    print(f"--- KERNEL: Calling I/O BUS (list_files: {path}) ---")
+    try:
+        with httpx.Client() as client:
+            res = client.get(f"{MCP_SERVER_URL}/fs/list", params={"path": path}, timeout=10)
+            res.raise_for_status()
+            return res.json()
+    except Exception as e:
+        return f"Error calling fs/list: {e}"
+
+@tool
+def search_web(query: str):
+    """
+    Searches the web, via the 'aura-web-mcp' server.
+    """
+    print(f"--- KERNEL: Calling I/O BUS (search_web: {query}) ---")
+    try:
+        with httpx.Client() as client:
+            res = client.get(f"{MCP_SERVER_URL}/web/search", params={"query": query}, timeout=10)
+            res.raise_for_status()
+            return res.json()
+    except Exception as e:
+        return f"Error calling web/search: {e}"
+
+@tool
+def add_to_memory(text_to_add: str, metadata: dict = None):
+    """
+    Adds a piece of text (a fact, a user preference, a code snippet) 
+    to the agent's long-term vector memory, via the 'aura-memory-mcp' server.
+    """
+    print(f"--- KERNEL: Calling I/O BUS (add_to_memory) ---")
+    try:
+        with httpx.Client() as client:
+            res = client.post(
+                f"{MCP_SERVER_URL}/memory/add",
+                json={"text": text_to_add, "metadata": metadata or {}},
+                timeout=10
+            )
+            res.raise_for_status()
+            return res.json()
+    except Exception as e:
+        return f"Error calling memory/add: {e}"
+
+@tool
+def query_memory(query: str):
+    """
+    Searches the agent's long-term vector memory for relevant information, 
+    via the 'aura-memory-mcp' server.
+    """
+    print(f"--- KERNEL: Calling I/O BUS (query_memory: {query}) ---")
+    try:
+        with httpx.Client() as client:
+            res = client.get(f"{MCP_SERVER_URL}/memory/query", params={"query": query}, timeout=10)
+            res.raise_for_status()
+            return res.json()
+    except Exception as e:
+        return f"Error calling memory/query: {e}"
+
+@tool
+def execute_code(code: str, lang: str = "python"):
+    """
+    Executes code (default: python) in a 'secure' sandbox, 
+    via the 'aura-sandbox-mcp' server.
+    Receives stdout, stderr, and return code.
+    """
+    print(f"--- KERNEL: Calling I/O BUS (execute_code) ---")
+    try:
+        with httpx.Client() as client:
+            res = client.post(
+                f"{MCP_SERVER_URL}/sandbox/exec",
+                json={"code": code, "lang": lang},
+                timeout=20 # Longer timeout for code execution
+            )
+            res.raise_for_status()
+            return res.json()
+    except Exception as e:
+        return f"Error calling sandbox/exec: {e}"
+
+# List of all tools for the agent
+all_tools = [
+    write_file, 
+    read_file, 
+    list_files, 
+    search_web, 
+    add_to_memory, 
+    query_memory, 
+    execute_code
+]
+
+# ============================================
+# === LAYER 4: MEMORY (Working Memory / "RAM")
+# ============================================
+class AppState(TypedDict):
+    messages: MessagesAddingReduped
+    task: str
+
+# ============================================
+# === LAYER 2: PROCESSOR (Agent Node)
+# ============================================
+# Bind the tools to the LLM
+llm_with_tools = llm.bind_tools(all_tools)
+
+def agent_node(state: AppState) -> dict:
+    """The main "processor" node. Runs the agent."""
+    print("--- PROCESSOR (Agent): Running... ---")
+    response = llm_with_tools.invoke(state['messages'])
+    return add_messages({"messages": [response]})
+
+# ============================================
+# === LAYER 1: KERNEL (The State Manager)
+# ============================================
+# Create the ToolExecutor
+tool_executor = ToolExecutor(all_tools)
+
+def tool_node(state: AppState) -> dict:
+    """The Kernel's I/O node. Calls the tools."""
+    print("--- KERNEL (Tool Node): Executing... ---")
+    last_message = state['messages'][-1]
+    tool_call_results = tool_executor.invoke(last_message)
+    return add_messages({"messages": tool_call_results})
+
+def should_continue(state: AppState) -> str:
+    """The Kernel's "scheduler." Routes control."""
+    print("--- KERNEL (Scheduler): Routing... ---")
+    last_message = state['messages'][-1]
+    if last_message.tool_calls:
+        print("--- KERNEL (Scheduler): -> TO I/O BUS ---")
+        return "call_tools"
+    print("--- KERNEL (Scheduler): -> TO END ---")
+    return END
+
+# --- Build the Graph ---
+print("--- KERNEL: Building Graph... ---")
+workflow = StateGraph(AppState)
+workflow.add_node("agent", agent_node)
+workflow.add_node("tools", tool_node)
+workflow.set_entry_point("agent")
+workflow.add_conditional_edges(
+    "agent",
+    should_continue,
+    {"call_tools": "tools", END: END}
+)
+workflow.add_edge("tools", "agent")
+
+# Compile the Kernel
+print("--- KERNEL: Compiling OS... ---")
+aura_os = workflow.compile()
+
+# --- Run the Aura OS ---
+def run_aura_os():
+    print("--- KERNEL: Booting OS... ---")
+    print("="*40)
+    
+    # Check if MCP server is alive
+    try:
+        httpx.get(f"{MCP_SERVER_URL}/fs/list", timeout=2)
+        print("--- KERNEL: I/O Bus connection confirmed. ---")
+    except httpx.ConnectError:
+        print("="*50)
+        print("--- KERNEL: FATAL ERROR ---")
+        print(f"Could not connect to MCP Server at {MCP_SERVER_URL}.")
+        print("Please ensure 'aura_mcp_servers.py' is running in a separate terminal.")
+        print("`python aura_mcp_servers.py`")
+        print("="*50)
+        return
+
+    # Complex multi-step task
+    task = """
+    My goal is to create a Python script that calculates the 
+    nth Fibonacci number.
+    
+    Here's the plan:
+    1.  First, search the web for 'simple python fibonacci function'.
+    2.  Based on the search, add the core algorithm as a new fact 
+        to my long-term memory.
+    3.  Write the full Python script, including a test case 
+        (e.g., `print(fib(10))`), to a file named 'fibonacci.py'.
+    4.  Execute the 'fibonacci.py' script using the sandbox.
+    5.  When you get the output, query your long-term memory for the 
+        algorithm you just stored.
+    6.  Finally, provide a report with:
+        a) The stdout of the script.
+        b) The memory you retrieved.
+    """
+    
+    initial_state = {
+        "messages": [HumanMessage(content=task)],
+        "task": task
+    }
+    
+    final_state = {}
+    print(f"--- KERNEL: Executing task... ---\n{task}\n")
+    print("="*40 + "\n")
+
+    for event in aura_os.stream(initial_state, {"recursion_limit": 20}):
+        step_name = list(event.keys())[0]
+        if not event[step_name]:
+            continue
+        step_output = event[step_name]
+        
+        print(f"\n[--- Event: Node '{step_name}' ---]")
+        
+        current_messages = step_output.get('messages', [])
+        if current_messages:
+            last_msg = current_messages[-1]
+            if hasattr(last_msg, 'pretty_print'):
+                last_msg.pretty_print()
+            else:
+                print(last_msg)
+        
+        print("-" * 20)
+        final_state.update(step_output)
+
+    print("\n" + "="*40)
+    print("--- KERNEL: OS Halted. ---")
+    print(f"Final Task: {final_state.get('task')}")
+    print(f"\n--- FINAL REPORT ---\n{final_state.get('messages', [])[-1].content}")
+    print("\n--- WORKSPACE CONTENTS ---")
+    os.system(f"ls -lR {WORKSPACE_DIR}")
+
+if __name__ == "__main__":
+    run_aura_os()
+

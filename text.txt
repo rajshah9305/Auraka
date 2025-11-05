@@ -1,0 +1,72 @@
+#!/bin/bash
+
+echo "--- AURA OS BOOTLOADER ---"
+
+# Set API key (User must set this manually)
+if [ -z "$OPENAI_API_KEY" ]; then
+    echo "ERROR: OPENAI_API_KEY is not set."
+    echo "Please set it before running: export OPENAI_API_KEY='sk-...'"
+    exit 1
+fi
+
+echo "--- Installing Dependencies ---"
+pip install --quiet \
+    "langgraph" \
+    "langchain-openai" \
+    "fastapi" \
+    "uvicorn[standard]" \
+    "httpx" \
+    "python-multipart" \
+    "duckduckgo-search" \
+    "faiss-cpu" \
+    "langchain"
+
+if [ $? -ne 0 ]; then
+    echo "ERROR: Pip install failed."
+    exit 1
+fi
+
+echo "--- Dependencies Installed ---"
+echo ""
+echo "--- Cleaning up previous workspace ---"
+rm -rf ./aura_workspace
+mkdir ./aura_workspace
+
+echo "--- Booting MCP Server (I/O Bus) in background ---"
+# Start the FastAPI server in the background
+python aura_mcp_servers.py &
+SERVER_PID=$!
+
+# Wait a few seconds for the server to boot
+sleep 5
+
+# Check if server is alive
+curl -s http://127.0.0.1:8100/fs/list > /dev/null
+if [ $? -ne 0 ]; then
+    echo "ERROR: MCP Server failed to start."
+    echo "Please try running 'python aura_mcp_servers.py' manually in a separate terminal."
+    kill $SERVER_PID
+    exit 1
+fi
+echo "--- I/O Bus is ONLINE ---"
+echo ""
+
+echo "================================================="
+echo "--- Booting Aura Kernel ---"
+echo "================================================="
+echo ""
+
+# Run the main Kernel script
+python aura_kernel.py
+
+echo ""
+echo "================================================="
+echo "--- Aura Kernel Halted ---"
+echo "================================================="
+echo ""
+
+# Clean up
+echo "--- Shutting down MCP Server ---"
+kill $SERVER_PID
+echo "--- AURA OS BOOTLOADER: FINISHED ---"
+
